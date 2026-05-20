@@ -1,0 +1,7 @@
+# Dagster+ code location manifest.
+locations:
+  - location_name: lambda_compute_demo
+    code_source:
+      module_name: lambda_compute_demo.definitions
+    build:
+      directory: .

@@ -1,0 +1,34 @@
+type: lambda_compute_demo.components.lambda_compute_component.LambdaComputeComponent
+
+attributes:
+  # The function name is derived from the Dagster+ deployment so prod,
+  # staging, and per-PR branch deployments each point at their own Lambda
+  # without any env-var injection in CI:
+  #
+  #   prod deployment   → lambda-compute-demo-compute-prod
+  #   staging deployment → lambda-compute-demo-compute-staging
+  #   branch deploy pr-N → lambda-compute-demo-compute-pr-N
+  #   local dev (no DAGSTER_CLOUD_DEPLOYMENT_NAME set) → ...-local
+  #
+  # Explicit `LAMBDA_FUNCTION_NAME` wins over the derived value — useful for
+  # local dev pointing at a shared staging Lambda, or for breaking the
+  # convention temporarily.
+  #
+  # IMPORTANT: keep the prefix in sync with `FUNCTION_NAME_PREFIX` in
+  # `infra/lambda_stack.py`.
+  function_name: "{{ env('LAMBDA_FUNCTION_NAME', 'lambda-compute-demo-compute-' + env('DAGSTER_CLOUD_DEPLOYMENT_NAME', 'local')) }}"
+  region_name: "{{ env('AWS_REGION', 'us-east-1') }}"
+
+  event:
+    source: dagster
+    pipeline: lambda_compute_demo
+
+  specs:
+    - key: warehouse/raw/orders
+      group_name: lambda_compute
+      kinds: [lambda, python]
+      description: "Orders table refreshed by AWS Lambda."
+    - key: warehouse/raw/customers
+      group_name: lambda_compute
+      kinds: [lambda, python]
+      description: "Customers table refreshed by AWS Lambda."

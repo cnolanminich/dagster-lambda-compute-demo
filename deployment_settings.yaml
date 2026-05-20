@@ -1,0 +1,13 @@
+# Dagster+ deployment settings.
+# Apply with: `dg plus deployment settings set-from-file deployment_settings.yaml`
+# (or from the Dagster+ UI under Deployment > Settings).
+#
+# Non-isolated runs execute inside the existing code location container rather
+# than spinning up a dedicated, isolated run pod. They start fast and share
+# resources with the code server. Because the actual compute is offloaded to
+# AWS Lambda by this project's component, the Dagster run itself only acts as
+# a thin orchestrator — non-isolated runs are a great fit.
+non_isolated_runs:
+  enabled: true
+  # Allow more than one Lambda invocation to be in-flight at a time.
+  max_concurrent_non_isolated_runs: 5

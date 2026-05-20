@@ -1,0 +1,164 @@
+name: Deploy
+
+# Coordinates two deploys per environment:
+#   1. The AWS Lambda function (via AWS CDK)
+#   2. The Dagster code location (via dg plus)
+#
+# Environment matrix:
+#   push to main      → env=prod         (deploy)
+#   push to staging   → env=staging      (deploy)
+#   pull_request open → env=pr-<NUMBER>  (deploy → Dagster+ branch deployment)
+#   pull_request close → env=pr-<NUMBER> (destroy → tear down the per-PR Lambda)
+#
+# The CDK env name matches the Dagster+ deployment name so that the Dagster
+# component (which derives the function name from DAGSTER_CLOUD_DEPLOYMENT_NAME)
+# connects to the right Lambda automatically — no env-var injection needed.
+#
+# Required repo secrets:
+#   AWS_ROLE_ARN              - IAM role assumed via OIDC for CDK
+#   AWS_REGION                - target AWS region (e.g. us-east-1)
+#   DAGSTER_CLOUD_API_TOKEN   - from `dg plus create ci-api-token`
+#   DAGSTER_CLOUD_ORGANIZATION
+#   DAGSTER_CLOUD_DEPLOYMENT  - "prod" (for the main code location)
+
+on:
+  push:
+    branches: [main, staging]
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
+    branches: [main]
+
+permissions:
+  id-token: write   # AWS OIDC
+  contents: read
+  pull-requests: write
+
+jobs:
+  # ─── Decide which environment we're acting on and whether to deploy or destroy.
+  classify:
+    name: Classify event
+    runs-on: ubuntu-latest
+    outputs:
+      env_name: ${{ steps.classify.outputs.env_name }}
+      action: ${{ steps.classify.outputs.action }}
+    steps:
+      - id: classify
+        run: |
+          set -euo pipefail
+          EVENT="${{ github.event_name }}"
+          REF="${{ github.ref }}"
+          PR="${{ github.event.number }}"
+          PR_ACTION="${{ github.event.action }}"
+
+          if [[ "$EVENT" == "push" && "$REF" == "refs/heads/main" ]]; then
+            ENV_NAME=prod
+            ACTION=deploy
+          elif [[ "$EVENT" == "push" && "$REF" == "refs/heads/staging" ]]; then
+            ENV_NAME=staging
+            ACTION=deploy
+          elif [[ "$EVENT" == "pull_request" && "$PR_ACTION" == "closed" ]]; then
+            ENV_NAME="pr-$PR"
+            ACTION=destroy
+          elif [[ "$EVENT" == "pull_request" ]]; then
+            ENV_NAME="pr-$PR"
+            ACTION=deploy
+          else
+            echo "Unhandled event: $EVENT $PR_ACTION on $REF" >&2
+            exit 1
+          fi
+
+          echo "env_name=$ENV_NAME" >> "$GITHUB_OUTPUT"
+          echo "action=$ACTION"   >> "$GITHUB_OUTPUT"
+          echo "Classified as env=$ENV_NAME action=$ACTION"
+
+  # ─── Deploy the per-env Lambda via CDK.
+  deploy-lambda:
+    name: Deploy Lambda (${{ needs.classify.outputs.env_name }})
+    needs: classify
+    if: needs.classify.outputs.action == 'deploy'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install CDK CLI
+        run: npm install -g aws-cdk@2
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Install CDK Python deps
+        working-directory: infra
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install -r requirements.txt
+
+      - name: cdk deploy
+        working-directory: infra
+        run: |
+          source .venv/bin/activate
+          cdk deploy \
+            -c env=${{ needs.classify.outputs.env_name }} \
+            --require-approval never
+
+  # ─── Tear down per-PR Lambda when the PR is closed.
+  destroy-lambda:
+    name: Destroy Lambda (${{ needs.classify.outputs.env_name }})
+    needs: classify
+    if: needs.classify.outputs.action == 'destroy'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - run: npm install -g aws-cdk@2
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Install CDK Python deps
+        working-directory: infra
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install -r requirements.txt
+
+      - name: cdk destroy
+        working-directory: infra
+        run: |
+          source .venv/bin/activate
+          cdk destroy \
+            -c env=${{ needs.classify.outputs.env_name }} \
+            --force
+
+  # ─── Deploy the Dagster code location after the Lambda exists.
+  deploy-dagster:
+    name: Deploy Dagster (${{ needs.classify.outputs.env_name }})
+    needs: [classify, deploy-lambda]
+    if: needs.classify.outputs.action == 'deploy'
+    runs-on: ubuntu-latest
+    env:
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+      DAGSTER_CLOUD_API_TOKEN: ${{ secrets.DAGSTER_CLOUD_API_TOKEN }}
+      DAGSTER_CLOUD_ORGANIZATION: ${{ secrets.DAGSTER_CLOUD_ORGANIZATION }}
+      DAGSTER_CLOUD_DEPLOYMENT: ${{ secrets.DAGSTER_CLOUD_DEPLOYMENT }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+      - run: uv sync --group dev
+      # dg plus deploy auto-detects PR context and pushes to the appropriate
+      # branch deployment when triggered from a pull_request event.
+      - run: uv run dg plus deploy

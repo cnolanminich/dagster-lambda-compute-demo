@@ -1,0 +1,33 @@
+type: lambda_compute_demo.components.lambda_with_provisioning_component.LambdaWithProvisioningComponent
+
+# This is the "Dagster manages its own infrastructure" variant. Materializing
+# the `infrastructure/LambdaComputeDemoStack-<env>` asset runs `cdk deploy`.
+# That asset is MANUAL-ONLY — no schedule, no automation condition, not part
+# of the compute job. The compute assets list it as a dep purely for lineage.
+
+attributes:
+  # Same naming convention as the base component — derives from the Dagster+
+  # deployment name so prod / staging / branch deploys each target their own
+  # Lambda + their own CDK stack.
+  function_name: "{{ env('LAMBDA_FUNCTION_NAME', 'lambda-compute-demo-compute-' + env('DAGSTER_CLOUD_DEPLOYMENT_NAME', 'local')) }}"
+  region_name: "{{ env('AWS_REGION', 'us-east-1') }}"
+
+  # Tells CDK which env to deploy.
+  env_name: "{{ env('DAGSTER_CLOUD_DEPLOYMENT_NAME', 'local') }}"
+  # Optional — defaults to LambdaComputeDemoStack-{env_name}.
+  # cdk_stack: LambdaComputeDemoStack-prod
+  cdk_dir: infra
+
+  event:
+    source: dagster
+    pipeline: lambda_compute_demo_with_provisioning
+
+  specs:
+    - key: warehouse/raw/orders_provisioned
+      group_name: lambda_compute_with_provisioning
+      kinds: [lambda, python]
+      description: "Orders table refreshed by Lambda (provisioned by Dagster)."
+    - key: warehouse/raw/customers_provisioned
+      group_name: lambda_compute_with_provisioning
+      kinds: [lambda, python]
+      description: "Customers table refreshed by Lambda (provisioned by Dagster)."
