@@ -1,0 +1,34 @@
+type: lambda_compute_demo.components.modal_compute_component.ModalComputeComponent
+
+# Base Modal variant: no pre-deployment. `modal run` ships local code to
+# Modal on each invocation. Runtime requirements in the code location:
+#   - `modal` CLI on PATH
+#   - `MODAL_TOKEN_ID` + `MODAL_TOKEN_SECRET` env vars (or ~/.modal.toml)
+
+attributes:
+  # Modal function reference passed to `modal run`. Path is relative to
+  # `project_directory` (the project root).
+  func_ref: "modal_apps/compute/app.py::process_assets"
+
+  # Where `modal run` is executed from. Modal needs to be able to import
+  # the function file from this dir.
+  project_directory: "."
+
+  # Modal "environment" — Modal's per-workspace namespace concept.
+  # Maps cleanly onto the Dagster+ deployment name (prod / staging / pr-N)
+  # so each Dagster+ deployment talks to its own Modal env.
+  modal_env: "{{ env('MODAL_ENVIRONMENT', env('DAGSTER_CLOUD_DEPLOYMENT_NAME', 'main')) }}"
+
+  extras:
+    source: dagster
+    pipeline: lambda_compute_demo_modal
+
+  specs:
+    - key: warehouse/raw/orders_modal
+      group_name: modal_compute
+      kinds: [modal, python]
+      description: "Orders table refreshed by Modal."
+    - key: warehouse/raw/customers_modal
+      group_name: modal_compute
+      kinds: [modal, python]
+      description: "Customers table refreshed by Modal."

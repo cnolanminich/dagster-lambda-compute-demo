@@ -6,6 +6,8 @@ dependencies = [
     "boto3>=1.43.10",
     "dagster==1.13.5",
     "dagster-aws>=0.29.5",
+    "dagster-modal>=0.0.5",
+    "modal>=1.4.3",
 ]
 
 [dependency-groups]

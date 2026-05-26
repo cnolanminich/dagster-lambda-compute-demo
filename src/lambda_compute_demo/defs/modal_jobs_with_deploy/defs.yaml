@@ -1,0 +1,29 @@
+type: lambda_compute_demo.components.modal_with_deploy_component.ModalWithDeployComponent
+
+# Modal variant where Dagster owns the `modal deploy` step. The deploy
+# asset is MANUAL-ONLY — no schedule, no automation condition, not in the
+# compute job. Compute assets list it as a dep purely for lineage.
+
+attributes:
+  # Same Modal config as the base component.
+  func_ref: "modal_apps/compute/app.py::process_assets"
+  project_directory: "."
+  modal_env: "{{ env('MODAL_ENVIRONMENT', env('DAGSTER_CLOUD_DEPLOYMENT_NAME', 'main')) }}"
+
+  # Tells the deploy asset which Modal app file to `modal deploy`.
+  modal_app: "modal_apps/compute/app.py"
+  modal_app_name: lambda-compute-demo-modal
+
+  extras:
+    source: dagster
+    pipeline: lambda_compute_demo_modal_with_deploy
+
+  specs:
+    - key: warehouse/raw/orders_modal_deployed
+      group_name: modal_compute_with_deploy
+      kinds: [modal, python]
+      description: "Orders table refreshed by Modal (deployed by Dagster)."
+    - key: warehouse/raw/customers_modal_deployed
+      group_name: modal_compute_with_deploy
+      kinds: [modal, python]
+      description: "Customers table refreshed by Modal (deployed by Dagster)."

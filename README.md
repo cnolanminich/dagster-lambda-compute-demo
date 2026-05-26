@@ -237,20 +237,26 @@ tagged `dagster/isolation: non-isolated`.
 lambda_compute_demo/
 ├── dagster_cloud.yaml              # Dagster+ code location manifest
 ├── deployment_settings.yaml        # non_isolated_runs.enabled = true
-├── pyproject.toml                  # dagster, dagster-aws, boto3
+├── pyproject.toml                  # dagster, dagster-aws, dagster-modal, boto3
 ├── src/lambda_compute_demo/
 │   ├── components/
-│   │   ├── lambda_compute_component.py           # Base component (CI deploys infra)
-│   │   └── lambda_with_provisioning_component.py # Variant (Dagster deploys infra)
+│   │   ├── lambda_compute_component.py           # Lambda base (CI deploys infra)
+│   │   ├── lambda_with_provisioning_component.py # Lambda + manual CDK provision
+│   │   ├── modal_compute_component.py            # Modal base (ephemeral `modal run`)
+│   │   └── modal_with_deploy_component.py        # Modal + manual `modal deploy`
 │   └── defs/
-│       ├── lambda_jobs/
-│       │   └── defs.yaml                  # Base component instance
-│       └── lambda_jobs_with_provisioning/
-│           └── defs.yaml                  # Variant component instance
+│       ├── lambda_jobs/                  # Lambda base instance
+│       ├── lambda_jobs_with_provisioning/  # Lambda + provision instance
+│       ├── modal_jobs/                   # Modal base instance
+│       └── modal_jobs_with_deploy/       # Modal + deploy instance
 ├── lambdas/
 │   └── compute/
 │       ├── handler.py              # Pipes-aware Lambda handler
 │       └── requirements.txt        # dagster-pipes
+├── modal_apps/
+│   └── compute/
+│       ├── app.py                  # Pipes-aware Modal function
+│       └── requirements.txt        # modal, dagster-pipes (for the host)
 ├── infra/
 │   ├── cdk_app.py                  # CDK app entrypoint
 │   ├── lambda_stack.py             # CDK stack defining the Lambda
@@ -455,9 +461,153 @@ If the `cdk` CLI isn't on `PATH`, the asset fails fast with a clear
   `src/lambda_compute_demo/defs/lambda_jobs_with_provisioning/` in real
   use.
 
+## Modal variant
+
+This project also ships **two Modal components** that mirror the Lambda
+ones one-for-one, using the `dagster-modal` integration. Same Pipes
+pattern, same non-isolated-run tagging — different serverless backend.
+
+### Components
+
+| Lambda variant | Modal variant | What it does |
+|---|---|---|
+| `LambdaComputeComponent` | `ModalComputeComponent` | Non-isolated Dagster run → Pipes → invoke serverless function |
+| `LambdaWithProvisioningComponent` | `ModalWithDeployComponent` | + manual-only "deploy" asset |
+
+The Modal components live in `src/lambda_compute_demo/components/modal_*.py`
+and the Modal app code lives in `modal_apps/compute/app.py`.
+
+### How invocation works (Modal vs. Lambda)
+
+The integration is a thin wrapper around the Modal CLI:
+[`dagster_modal.ModalClient`](https://docs.dagster.io/api/python-api/libraries/dagster-modal#dagster_modal.ModalClient)
+extends `PipesSubprocessClient` and runs `modal run <func_ref>` as a
+subprocess of the Dagster run. Pipes context flows through env vars set
+on that subprocess, materializations and logs flow back through the Pipes
+message channel.
+
+```python
+# Inside the Modal app (modal_apps/compute/app.py):
+@app.function(image=image, timeout=900)
+def process_assets() -> None:
+    with open_dagster_pipes() as pipes:
+        for asset_key in pipes.get_extra("selected_asset_keys") or []:
+            # ...real work on Modal's infra...
+            pipes.report_asset_materialization(asset_key=asset_key, metadata={...})
+```
+
+### Key behavioral differences from Lambda
+
+| | Lambda + Pipes | Modal + Pipes |
+|---|---|---|
+| Pre-deploy required? | **Yes** — Lambda must exist; you call it by ARN/name | **No** — `modal run` ships local code on each invocation |
+| Invocation mechanism | `boto3.client("lambda").invoke(...)` (HTTP API) | `subprocess.Popen(["modal", "run", ...])` (CLI) |
+| Hard timeout | **15 min** | **24 hours** (default; configurable) |
+| Max memory | **10 GB** | **300+ GB** (depending on plan) |
+| GPU support | No | **Yes** (A10/A100/H100) |
+| Container image | OCI image, 10 GB cap | OCI image, 50+ GB cap |
+| Cold start | 100 ms – 10 s | 1 – 30 s (longer for big images) |
+| Concurrency model | One invocation = one container | One invocation = N containers (Modal `.map()`) |
+| Cost model | Per-invocation + per-GB-second | Per-GPU/CPU-second, billed by Modal |
+
+### Latency comparison
+
+Adding Modal rows to the latency table from earlier:
+
+| Pattern | Run startup | Invocation overhead | Compute ceiling | Typical end-to-end for a 30 s job |
+|---|---|---|---|---|
+| Non-isolated run → Lambda (warm) | < 1 s | 50–500 ms | 15 min | ~31–35 s |
+| Non-isolated run → Lambda (cold) | < 1 s | 1–10 s | 15 min | ~32–41 s |
+| **Non-isolated run → Modal (warm)** | **< 1 s** | **0.5–2 s** (CLI overhead) | **24 h** | **~32–34 s** |
+| **Non-isolated run → Modal (cold)** | **< 1 s** | **5–30 s** | **24 h** | **~36–60 s** |
+| Non-isolated run → ECS Fargate task | < 1 s | 30–90 s | unlimited | ~61–121 s |
+
+Notes:
+
+- Modal's **CLI overhead** (~0.5–2 s warm) is higher than Lambda's HTTP
+  invoke (~50–500 ms warm) because the `modal run` subprocess does code
+  hash checking, image lookup, and bidirectional log streaming setup.
+- Modal **cold starts vary wildly** with image size — a slim Python image
+  cold-starts in 1–3 s, a multi-GB image with CUDA + models takes 20–30 s.
+  Use `keep_warm=N` on `@app.function` to hold N containers warm.
+- For **fast, small, stateless work**, Lambda is still the latency king.
+  For **long, GPU-heavy, large-memory** workloads, Modal wins by being
+  the only option that allows it at all.
+
+### When to use Modal over Lambda
+
+- You need **GPUs** (Modal has them; Lambda doesn't).
+- You need **> 15 min compute** (Lambda's hard cap is 15 min).
+- You need **> 10 GB memory** or **large container images** (Modal allows
+  much bigger).
+- You want to develop in Python end-to-end without CDK / IaC ceremony —
+  Modal's "deploy = `modal deploy app.py`" model is dramatically simpler
+  than Lambda + CloudFormation.
+- You want **Modal's `.map()` fan-out**: a single function call spawning
+  N parallel containers, all reporting back through one Pipes session.
+
+### When to stay with Lambda
+
+- You're already deep in AWS and want IAM/VPC integration without a
+  third-party hop.
+- You need **very low latency per invocation** (Lambda HTTP invoke beats
+  Modal CLI invoke).
+- Your compute is small and frequent — Lambda's pricing is cheaper at
+  high volume for tiny invocations.
+
+### The `ModalWithDeployComponent` variant
+
+Same manual-only enforcement as the Lambda variant — the deploy asset:
+
+- Has no `AutomationCondition` (declarative automation skips it).
+- Is excluded from the compute job (schedules skip it).
+- Is tagged `manual_only=true`.
+- Is listed as a `dep` of compute assets purely for lineage.
+
+When materialized, it shells out to:
+
+```
+modal deploy --env <modal_env> modal_apps/compute/app.py
+```
+
+Stdout streams into the Dagster run logs and the result lands as
+`MaterializeResult` metadata (app file, env, func_ref, deploy log tail).
+
+### Multi-environment story for Modal
+
+Modal has its own concept of **environments** (per-workspace namespaces).
+The `modal_env` field is wired up the same way the Lambda function name
+is — derived from `DAGSTER_CLOUD_DEPLOYMENT_NAME` with an explicit
+override env var (`MODAL_ENVIRONMENT`):
+
+```yaml
+modal_env: "{{ env('MODAL_ENVIRONMENT', env('DAGSTER_CLOUD_DEPLOYMENT_NAME', 'main')) }}"
+```
+
+So the same convention used for Lambda + CDK applies: Dagster+ `prod`
+deployment talks to Modal env `prod`, `pr-123` talks to Modal env
+`pr-123`, etc. Modal envs are cheaper to create than per-PR
+CloudFormation stacks (no CFN provisioning overhead), so per-PR Modal
+environments are even more practical than per-PR Lambdas.
+
+### Runtime requirements
+
+The Dagster code location container needs:
+
+- **`modal` CLI on PATH** — `pip install modal` puts it there.
+- **Modal auth** — `MODAL_TOKEN_ID` + `MODAL_TOKEN_SECRET` env vars
+  (set in Dagster+ deployment settings), or `~/.modal.toml` for local dev
+  (`modal token new`).
+
+No Node.js or CDK CLI needed for the base Modal pattern. Only the
+`ModalWithDeployComponent` variant needs `modal` available at runtime
+(same as the Lambda variant needs `cdk` available at runtime).
+
 ## Learn more
 
 - [Dagster Pipes overview](https://docs.dagster.io/concepts/dagster-pipes)
 - [PipesLambdaClient API](https://docs.dagster.io/api/python-api/libraries/dagster-aws#dagster_aws.pipes.PipesLambdaClient)
+- [dagster-modal `ModalClient`](https://docs.dagster.io/api/python-api/libraries/dagster-modal)
+- [Modal documentation](https://modal.com/docs)
 - [Non-isolated runs (Dagster+)](https://docs.dagster.io/dagster-plus/deployment/management/non-isolated-runs)
 - [Dagster Components](https://docs.dagster.io/concepts/components)
